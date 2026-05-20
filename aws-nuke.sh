@@ -9,13 +9,12 @@
 #
 # Hard requirements:
 #   - Must run inside AWS CloudShell (AWS_EXECUTION_ENV=CloudShell).
-#   - Active caller must be CloudShell's own assumed role
-#     (arn:...:assumed-role/AWSCloudShell-*), not AWS_PROFILE / assume-role
-#     credentials pointing at another account. This guarantees the nuke
-#     targets only the account CloudShell is currently running in.
+#     The active credentials can be CloudShell's own role or any role you've
+#     assumed inside CloudShell — whatever the active credentials point at is
+#     the account that gets nuked.
 #
 # The single confirmation is your AWS account ID — TYPED, not pasted.
-# Pastes are detected by inter-character timing and rejected.
+# Pastes are detected by total elapsed input time and rejected.
 #
 # Env vars:
 #   STACK_NAME         CloudFormation stack name (default: aws-nuke)
@@ -53,17 +52,6 @@ fi
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}"
 [[ -z "${REGION}" ]] && die "No region configured. Set AWS_REGION or run 'aws configure'."
 
-# --- Hard requirement: caller must be CloudShell's own role, not an
-# assume-role / AWS_PROFILE override pointing at a different account. ---
-CALLER_ARN="$(aws sts get-caller-identity --query Arn --output text)"
-case "${CALLER_ARN}" in
-  *:assumed-role/AWSCloudShell-*) : ;;
-  *)
-    red "Active caller ARN: ${CALLER_ARN}"
-    die "Active credentials are not CloudShell's own role. Refusing. Unset AWS_PROFILE / AWS_ACCESS_KEY_ID and use the default CloudShell credentials so this script targets only the account CloudShell is running in."
-    ;;
-esac
-
 bold "── aws-nuke-self-destruct ──"
 echo "Region:        ${REGION}"
 echo "Stack name:    ${STACK_NAME}"
@@ -79,12 +67,6 @@ aws sts get-caller-identity --output table
 # at a different account.
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 [[ -z "${ACCOUNT_ID}" ]] && die "Could not determine account id."
-
-# Sanity: the ARN we already validated must belong to the same account.
-ARN_ACCOUNT="$(echo "${CALLER_ARN}" | awk -F: '{print $5}')"
-if [[ "${ARN_ACCOUNT}" != "${ACCOUNT_ID}" ]]; then
-  die "Caller ARN account (${ARN_ACCOUNT}) does not match get-caller-identity account (${ACCOUNT_ID})."
-fi
 
 ALIAS="$(aws iam list-account-aliases --query 'AccountAliases[0]' --output text 2>/dev/null || echo None)"
 [[ "${ALIAS}" == "None" ]] && ALIAS=""
