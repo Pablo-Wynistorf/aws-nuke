@@ -64,7 +64,7 @@ Resources:
             Value: !Ref AWS::AccountId
           - Name: STACK_NAME
             Value: !Ref AWS::StackName
-          - Name: CODEBUILD_ROLE_NAME
+          - Name: NUKE_ROLE_NAME
             Value: !Sub "${AWS::StackName}-codebuild-role"
       LogsConfig:
         CloudWatchLogs:
