@@ -74,6 +74,8 @@ Resources:
         Type: NO_SOURCE
         BuildSpec: |
           version: 0.2
+          env:
+            shell: bash
           phases:
             install:
               commands:
