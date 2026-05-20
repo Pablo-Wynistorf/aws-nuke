@@ -84,45 +84,30 @@ if [[ "${FORCE}" != "1" ]]; then
 fi
 
 # --- Anti-paste typed confirmation ---
-# Reads the account id with a normal line-mode read, then rejects the input
-# if the total elapsed time is too short to be human typing. Pastes deliver
-# all bytes within milliseconds; typing a 12-digit account id takes seconds.
+# Read the account id directly from /dev/tty. This works under `curl | bash`
+# even though stdin is the pipe — the redirect on the read itself is more
+# reliable in CloudShell than `exec </dev/tty`.
 prompt_typed_account_id() {
   local target="$1"
-  local per_char_ms=80          # min ms per character for "real typing"
-  local entered start_ns end_ns elapsed_ms min_ms
+  local entered=""
 
-  # Re-attach stdin to the terminal so this works under 'curl | bash'.
-  if [[ ! -t 0 ]] && [[ -e /dev/tty ]]; then
-    exec </dev/tty
-  fi
-  if [[ ! -t 0 ]]; then
-    die "No terminal available for confirmation. Run with a TTY attached."
+  if [[ ! -e /dev/tty ]]; then
+    die "No terminal available for confirmation."
   fi
 
-  red    "WARNING: this will WIPE EVERYTHING in account ${ACCOUNT_ID}"
-  red    "across every enabled region. There is no undo."
-  echo
-  yellow "Type the account ID by hand. Pastes will be REJECTED."
-  yellow "Press Enter when finished."
-  echo
-  printf '> '
+  {
+    red    "WARNING: this will WIPE EVERYTHING in account ${ACCOUNT_ID}"
+    red    "across every enabled region. There is no undo."
+    echo
+    yellow "Type the account ID and press Enter."
+    yellow "(Pasting works but you should type it — the typing IS the confirmation.)"
+    printf '> '
+  } >/dev/tty
 
-  start_ns="$(date +%s%N 2>/dev/null || echo 0)"
-  IFS= read -r entered || die "Input closed."
-  end_ns="$(date +%s%N 2>/dev/null || echo 0)"
+  IFS= read -r entered </dev/tty || die "Input closed."
 
   if [[ "${entered}" != "${target}" ]]; then
-    die "Account id mismatch. Aborting."
-  fi
-
-  if [[ "${PASTE_GUARD}" == "1" && "${start_ns}" != "0" && "${end_ns}" != "0" ]]; then
-    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
-    min_ms=$(( ${#target} * per_char_ms ))
-    if (( elapsed_ms < min_ms )); then
-      red "Input completed in ${elapsed_ms}ms (expected at least ${min_ms}ms)."
-      die "That looks pasted. You must TYPE the account id."
-    fi
+    die "Account id mismatch (got '${entered}'). Aborting."
   fi
 }
 
