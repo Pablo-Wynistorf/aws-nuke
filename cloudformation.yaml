@@ -1,0 +1,165 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Self-destruct kit for an AWS account. Deploys a CodeBuild project that runs
+  ekristen/aws-nuke against every enabled region. The bootstrap script starts
+  the build after the user types the account id; the build deletes its own
+  CloudFormation stack in post_build, so nothing is left behind.
+
+Parameters:
+  AwsNukeVersion:
+    Type: String
+    Default: "3.49.0"
+    Description: ekristen/aws-nuke release version (without leading v).
+
+Resources:
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${AWS::StackName}"
+      RetentionInDays: 14
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-codebuild-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # aws-nuke needs admin to delete everything in the account.
+        # The same role also calls cloudformation:DeleteStack on itself.
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Policies:
+        - PolicyName: codebuild-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CodeBuildLogGroup.Arn
+
+  NukeProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-runner"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 480
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: AWS_NUKE_VERSION
+            Value: !Ref AwsNukeVersion
+          - Name: TARGET_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: STACK_NAME
+            Value: !Ref AWS::StackName
+          - Name: CODEBUILD_ROLE_NAME
+            Value: !Sub "${AWS::StackName}-codebuild-role"
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CodeBuildLogGroup
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - |
+                  set -euo pipefail
+                  echo "Installing aws-nuke v${AWS_NUKE_VERSION}"
+                  cd /tmp
+                  curl -sSL -o aws-nuke.tgz "https://github.com/ekristen/aws-nuke/releases/download/v${AWS_NUKE_VERSION}/aws-nuke-v${AWS_NUKE_VERSION}-linux-amd64.tar.gz"
+                  tar -xzf aws-nuke.tgz
+                  chmod +x aws-nuke
+                  ./aws-nuke version
+            pre_build:
+              commands:
+                - |
+                  set -euo pipefail
+                  echo "Caller identity:"
+                  aws sts get-caller-identity
+                  echo "Building region list from describe-regions"
+                  REGIONS=$(aws ec2 describe-regions --all-regions \
+                    --query "Regions[?OptInStatus!='not-opted-in'].RegionName" \
+                    --output text)
+                  echo "Regions: ${REGIONS}"
+                  {
+                    echo "regions:"
+                    echo "  - global"
+                    for r in ${REGIONS}; do echo "  - ${r}"; done
+                    echo
+                    echo "blocklist:"
+                    echo "  - \"000000000000\""
+                    echo
+                    echo "accounts:"
+                    echo "  \"${TARGET_ACCOUNT_ID}\":"
+                    echo "    filters:"
+                    echo "      CloudFormationStack:"
+                    echo "        - type: exact"
+                    echo "          value: \"${STACK_NAME}\""
+                    echo "      IAMRole:"
+                    echo "        - type: exact"
+                    echo "          value: \"${CODEBUILD_ROLE_NAME}\""
+                    echo "        - type: glob"
+                    echo "          value: \"AWSServiceRole*\""
+                    echo "      IAMRolePolicy:"
+                    echo "        - type: glob"
+                    echo "          value: \"${CODEBUILD_ROLE_NAME} -> *\""
+                    echo "      IAMRolePolicyAttachment:"
+                    echo "        - type: glob"
+                    echo "          value: \"${CODEBUILD_ROLE_NAME} -> *\""
+                    echo "      CloudWatchLogsLogGroup:"
+                    echo "        - type: glob"
+                    echo "          value: \"/aws/codebuild/${STACK_NAME}*\""
+                    echo "      CodeBuildProject:"
+                    echo "        - type: glob"
+                    echo "          value: \"${STACK_NAME}*\""
+                  } > /tmp/nuke-config.yaml
+                  echo "------ nuke-config.yaml ------"
+                  cat /tmp/nuke-config.yaml
+                  echo "------------------------------"
+            build:
+              commands:
+                - |
+                  echo "Firing aws-nuke against account ${TARGET_ACCOUNT_ID}"
+                  set +e
+                  /tmp/aws-nuke run \
+                    --config /tmp/nuke-config.yaml \
+                    --no-prompt \
+                    --no-dry-run \
+                    --no-alias-check \
+                    --log-format json
+                  echo $? > /tmp/nuke-rc
+                  echo "aws-nuke exit code: $(cat /tmp/nuke-rc)"
+            post_build:
+              # post_build runs even if build failed — the stack tears itself
+              # down regardless of nuke outcome. delete-stack is async, so the
+              # build can finish while CFN continues removing the role/logs.
+              commands:
+                - |
+                  echo "Self-destructing CloudFormation stack ${STACK_NAME}..."
+                  aws cloudformation delete-stack --stack-name "${STACK_NAME}" || true
+                  echo "delete-stack initiated."
+                  RC=$(cat /tmp/nuke-rc 2>/dev/null || echo 0)
+                  echo "Final aws-nuke exit code: ${RC}"
+                  exit "${RC}"
+
+Outputs:
+  CodeBuildProjectName:
+    Value: !Ref NukeProject
+
+  CodeBuildLogGroupName:
+    Value: !Ref CodeBuildLogGroup
