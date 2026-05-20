@@ -7,6 +7,13 @@
 #
 #   curl -sSL https://raw.githubusercontent.com/Pablo-Wynistorf/aws-nuke/main/aws-nuke.sh | bash
 #
+# Hard requirements:
+#   - Must run inside AWS CloudShell (AWS_EXECUTION_ENV=CloudShell).
+#   - Active caller must be CloudShell's own assumed role
+#     (arn:...:assumed-role/AWSCloudShell-*), not AWS_PROFILE / assume-role
+#     credentials pointing at another account. This guarantees the nuke
+#     targets only the account CloudShell is currently running in.
+#
 # The single confirmation is your AWS account ID — TYPED, not pasted.
 # Pastes are detected by inter-character timing and rejected.
 #
@@ -37,8 +44,25 @@ die()    { red "ERROR: $*"; exit 1; }
 command -v aws  >/dev/null || die "aws CLI not found. Run from CloudShell or any host with aws CLI."
 command -v curl >/dev/null || die "curl not found."
 
+# --- Hard requirement: must be running inside AWS CloudShell ---
+# CloudShell sets AWS_EXECUTION_ENV=CloudShell. Refuse otherwise.
+if [[ "${AWS_EXECUTION_ENV:-}" != "CloudShell" ]]; then
+  die "This script only runs inside AWS CloudShell (got AWS_EXECUTION_ENV='${AWS_EXECUTION_ENV:-<unset>}')."
+fi
+
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-$(aws configure get region 2>/dev/null || true)}}"
 [[ -z "${REGION}" ]] && die "No region configured. Set AWS_REGION or run 'aws configure'."
+
+# --- Hard requirement: caller must be CloudShell's own role, not an
+# assume-role / AWS_PROFILE override pointing at a different account. ---
+CALLER_ARN="$(aws sts get-caller-identity --query Arn --output text)"
+case "${CALLER_ARN}" in
+  *:assumed-role/AWSCloudShell-*) : ;;
+  *)
+    red "Active caller ARN: ${CALLER_ARN}"
+    die "Active credentials are not CloudShell's own role. Refusing. Unset AWS_PROFILE / AWS_ACCESS_KEY_ID and use the default CloudShell credentials so this script targets only the account CloudShell is running in."
+    ;;
+esac
 
 bold "── aws-nuke-self-destruct ──"
 echo "Region:        ${REGION}"
@@ -50,8 +74,17 @@ echo
 bold "Caller identity"
 aws sts get-caller-identity --output table
 
+# Snapshot the account ID NOW. Every subsequent step references this snapshot
+# so a mid-run AWS_PROFILE change or sts-assume-role can't redirect the nuke
+# at a different account.
 ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 [[ -z "${ACCOUNT_ID}" ]] && die "Could not determine account id."
+
+# Sanity: the ARN we already validated must belong to the same account.
+ARN_ACCOUNT="$(echo "${CALLER_ARN}" | awk -F: '{print $5}')"
+if [[ "${ARN_ACCOUNT}" != "${ACCOUNT_ID}" ]]; then
+  die "Caller ARN account (${ARN_ACCOUNT}) does not match get-caller-identity account (${ACCOUNT_ID})."
+fi
 
 ALIAS="$(aws iam list-account-aliases --query 'AccountAliases[0]' --output text 2>/dev/null || echo None)"
 [[ "${ALIAS}" == "None" ]] && ALIAS=""
@@ -69,86 +102,46 @@ if [[ "${FORCE}" != "1" ]]; then
 fi
 
 # --- Anti-paste typed confirmation ---
-# Reads the account id one byte at a time. Any inter-byte gap shorter than the
-# threshold is treated as a paste. Real human typing is reliably >30ms between
-# keystrokes; programmatic pastes deliver a full burst within microseconds.
+# Reads the account id with a normal line-mode read, then rejects the input
+# if the total elapsed time is too short to be human typing. Pastes deliver
+# all bytes within milliseconds; typing a 12-digit account id takes seconds.
 prompt_typed_account_id() {
   local target="$1"
-  local threshold_ms=30
-  local entered=""
-  local prev_ns=0 now_ns gap_ns gap_ms ch
+  local per_char_ms=80          # min ms per character for "real typing"
+  local entered start_ns end_ns elapsed_ms min_ms
 
   # Re-attach stdin to the terminal so this works under 'curl | bash'.
   if [[ ! -t 0 ]] && [[ -e /dev/tty ]]; then
     exec </dev/tty
   fi
   if [[ ! -t 0 ]]; then
-    die "No terminal available for confirmation. Run the script with a TTY attached."
+    die "No terminal available for confirmation. Run with a TTY attached."
   fi
 
   red    "WARNING: this will WIPE EVERYTHING in account ${ACCOUNT_ID}"
   red    "across every enabled region. There is no undo."
   echo
   yellow "Type the account ID by hand. Pastes will be REJECTED."
-  yellow "Backspace to correct typos. Press Enter when finished."
+  yellow "Press Enter when finished."
   echo
   printf '> '
 
-  while :; do
-    # Single-byte raw read with no echo.
-    if ! IFS= read -rsn1 ch; then
-      echo
-      die "Input closed."
-    fi
-    now_ns=$(date +%s%N 2>/dev/null || echo 0)
+  start_ns="$(date +%s%N 2>/dev/null || echo 0)"
+  IFS= read -r entered || die "Input closed."
+  end_ns="$(date +%s%N 2>/dev/null || echo 0)"
 
-    # Enter -> compare and decide.
-    if [[ -z "${ch}" ]]; then
-      echo
-      if [[ "${entered}" == "${target}" ]]; then
-        return 0
-      fi
-      die "Account id mismatch. Aborting."
-    fi
+  if [[ "${entered}" != "${target}" ]]; then
+    die "Account id mismatch. Aborting."
+  fi
 
-    # Backspace (DEL 0x7f or BS 0x08).
-    if [[ "${ch}" == $'\x7f' || "${ch}" == $'\b' ]]; then
-      if [[ -n "${entered}" ]]; then
-        entered="${entered%?}"
-        printf '\b \b'
-      fi
-      prev_ns="${now_ns}"
-      continue
+  if [[ "${PASTE_GUARD}" == "1" && "${start_ns}" != "0" && "${end_ns}" != "0" ]]; then
+    elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+    min_ms=$(( ${#target} * per_char_ms ))
+    if (( elapsed_ms < min_ms )); then
+      red "Input completed in ${elapsed_ms}ms (expected at least ${min_ms}ms)."
+      die "That looks pasted. You must TYPE the account id."
     fi
-
-    # Only digits are valid in an AWS account id.
-    if [[ ! "${ch}" =~ ^[0-9]$ ]]; then
-      # Silently ignore non-digits (e.g. arrow keys send escape sequences).
-      prev_ns="${now_ns}"
-      continue
-    fi
-
-    # Paste detection — skip on the very first keystroke.
-    if [[ "${PASTE_GUARD}" == "1" && "${prev_ns}" != "0" && "${now_ns}" != "0" ]]; then
-      gap_ns=$(( now_ns - prev_ns ))
-      gap_ms=$(( gap_ns / 1000000 ))
-      if (( gap_ms < threshold_ms )); then
-        echo
-        red "Paste detected (gap ${gap_ms}ms < ${threshold_ms}ms). You must TYPE the account id."
-        die "Aborted."
-      fi
-    fi
-
-    entered+="${ch}"
-    printf '%s' "${ch}"
-    prev_ns="${now_ns}"
-
-    # Hard cap so we don't spin forever on a wedged terminal.
-    if (( ${#entered} > 20 )); then
-      echo
-      die "Input too long."
-    fi
-  done
+  fi
 }
 
 prompt_typed_account_id "${ACCOUNT_ID}"
@@ -175,15 +168,36 @@ green "Template validated."
 
 # --- Deploy ---
 echo
-bold "Deploying CloudFormation stack..."
-aws cloudformation deploy \
-  --stack-name "${STACK_NAME}" \
-  --template-file "${TEMPLATE_FILE}" \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --region "${REGION}" \
-  --no-fail-on-empty-changeset \
-  --parameter-overrides \
-    "AwsNukeVersion=${AWS_NUKE_VERSION}"
+bold "Deploying CloudFormation stack (this usually takes 30-90s)..."
+# Run deploy in the background so we can show progress dots.
+DEPLOY_LOG="$(mktemp)"
+(
+  aws cloudformation deploy \
+    --stack-name "${STACK_NAME}" \
+    --template-file "${TEMPLATE_FILE}" \
+    --capabilities CAPABILITY_NAMED_IAM \
+    --region "${REGION}" \
+    --no-fail-on-empty-changeset \
+    --parameter-overrides "AwsNukeVersion=${AWS_NUKE_VERSION}" \
+    >"${DEPLOY_LOG}" 2>&1
+  echo "$?" >"${DEPLOY_LOG}.rc"
+) &
+DEPLOY_PID=$!
+while kill -0 "${DEPLOY_PID}" 2>/dev/null; do
+  printf '.'
+  sleep 5
+done
+wait "${DEPLOY_PID}" 2>/dev/null || true
+echo
+DEPLOY_RC="$(cat "${DEPLOY_LOG}.rc" 2>/dev/null || echo 1)"
+if [[ "${DEPLOY_RC}" != "0" ]]; then
+  red "CloudFormation deploy failed:"
+  cat "${DEPLOY_LOG}"
+  rm -f "${DEPLOY_LOG}" "${DEPLOY_LOG}.rc"
+  exit 1
+fi
+cat "${DEPLOY_LOG}"
+rm -f "${DEPLOY_LOG}" "${DEPLOY_LOG}.rc"
 green "Stack deployed."
 
 get_output() {
@@ -212,7 +226,23 @@ green "Build started: ${BUILD_ID}"
 # --- Tail logs while the build runs ---
 if [[ "${TAIL_LOGS}" == "1" ]]; then
   echo
-  echo "Tailing CloudWatch logs (Ctrl-C to stop tailing — the build keeps running):"
+  bold "Waiting for the build to start producing logs..."
+  # Wait up to ~3 minutes for the log group to have at least one stream.
+  for _ in $(seq 1 36); do
+    STREAMS="$(aws logs describe-log-streams \
+      --log-group-name "${LOG_GROUP}" \
+      --region "${REGION}" \
+      --max-items 1 \
+      --query 'length(logStreams)' \
+      --output text 2>/dev/null || echo 0)"
+    if [[ "${STREAMS}" =~ ^[0-9]+$ ]] && (( STREAMS > 0 )); then
+      break
+    fi
+    printf '.'
+    sleep 5
+  done
+  echo
+  green "Logs ready. Tailing (Ctrl-C stops tailing only — the build keeps running):"
   echo
   aws logs tail "${LOG_GROUP}" --region "${REGION}" --follow --format short || true
 fi
