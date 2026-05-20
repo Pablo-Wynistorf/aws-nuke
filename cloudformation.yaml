@@ -106,6 +106,9 @@ Resources:
                     echo "blocklist:"
                     echo "  - \"000000000000\""
                     echo
+                    echo "bypass-alias-check-accounts:"
+                    echo "  - \"${TARGET_ACCOUNT_ID}\""
+                    echo
                     echo "accounts:"
                     echo "  \"${TARGET_ACCOUNT_ID}\":"
                     echo "    filters:"
